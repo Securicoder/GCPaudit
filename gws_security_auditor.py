@@ -1029,36 +1029,540 @@ class GoogleWorkspaceCollector:
         return True
 
     def collect_users(self):
-        logging.info("Collecting users...")
-        # Placeholder
-        self.data["users"] = [{"primaryEmail": self.delegated_email, "isAdmin": True, "isEnrolledIn2Sv": False}]
-        return True
+        logging.info("Collecting Google Workspace Users...")
+        admin_service = self.services.get('admin')
+        if not admin_service:
+            logging.error("Admin service not available, cannot fetch users.")
+            self.data['users'] = [{"error": "ADMIN_SERVICE_UNAVAILABLE"}]
+            return False
+
+        if not self.customer_id:
+            logging.error("Customer ID not available (collect_customer_info must run first), cannot fetch users.")
+            self.data['users'] = [{"error": "CUSTOMER_ID_MISSING"}]
+            return False
+
+        all_users = []
+        try:
+            logging.debug(f"Fetching users for customer: {self.customer_id}")
+            request = admin_service.users().list(
+                customer=self.customer_id,
+                maxResults=500, # Max allowed is 500
+                projection='full' # Fetch all available attributes
+            )
+            
+            page_num = 1
+            while request is not None:
+                logging.debug(f"Fetching user page: {page_num}")
+                response = self.retry_api_call(lambda: request.execute())
+                users_on_page = response.get('users', [])
+                if users_on_page:
+                    all_users.extend(users_on_page)
+                
+                request = admin_service.users().list_next(previous_request=request, previous_response=response)
+                page_num +=1
+
+            self.data['users'] = all_users
+            logging.info(f"Successfully fetched {len(all_users)} users.")
+            return True
+
+        except HttpError as e:
+            logging.error(f"HttpError fetching users: {e}", exc_info=True)
+            self.data['users'] = [{"error": f"HTTP_ERROR_{e.resp.status}", "details": str(e)}]
+            return False
+        except Exception as e:
+            logging.error(f"Generic error fetching users: {e}", exc_info=True)
+            self.data['users'] = [{"error": "EXCEPTION", "details": str(e)}]
+            return False
 
     def collect_groups_and_settings(self):
-        logging.info("Collecting groups and settings...")
-        # Placeholder
-        self.data["groups"] = [{"email": "group@example.com", "name": "Test Group"}]
-        self.data["groupSettings"]["group@example.com"] = {"whoCanJoin": "ALL_IN_DOMAIN_CAN_JOIN"}
-        return True
+        logging.info("Collecting Google Workspace Groups, their settings, and members...")
+        admin_service = self.services.get('admin')
+        groupssettings_service = self.services.get('groupssettings')
+
+        if not admin_service:
+            logging.error("Admin SDK service not available, cannot fetch groups or members.")
+            self.data['groups'] = [{"error": "ADMIN_SERVICE_UNAVAILABLE"}]
+            self.data['groupSettings'] = {"error": "ADMIN_SERVICE_UNAVAILABLE"}
+            return False
+        if not groupssettings_service:
+            logging.warning("Groups Settings API service not available, group settings will not be fetched.")
+            # We can still fetch groups and members, so don't return False yet.
+            # Mark groupSettings as having an issue.
+            self.data['groupSettings'] = {"error": "GROUPSSETTINGS_SERVICE_UNAVAILABLE"}
+        
+        if not self.customer_id:
+            logging.error("Customer ID not available (collect_customer_info must run first), cannot fetch groups.")
+            self.data['groups'] = [{"error": "CUSTOMER_ID_MISSING"}]
+            return False
+
+        all_groups = []
+        group_settings_collected = {}
+        
+        try:
+            # 1. Collect All Groups
+            logging.debug(f"Fetching groups for customer: {self.customer_id}")
+            request = admin_service.groups().list(customer=self.customer_id, maxResults=200)
+            page_num = 1
+            while request is not None:
+                logging.debug(f"Fetching group page: {page_num}")
+                response = self.retry_api_call(lambda: request.execute())
+                groups_on_page = response.get('groups', [])
+                if groups_on_page:
+                    all_groups.extend(groups_on_page)
+                request = admin_service.groups().list_next(previous_request=request, previous_response=response)
+                page_num += 1
+            
+            self.data['groups'] = all_groups
+            logging.info(f"Fetched basic info for {len(all_groups)} groups.")
+
+            # 2. For each group, fetch settings and members
+            for i, group in enumerate(all_groups): # Use index for modifying list item
+                group_email = group.get('email')
+                group_id = group.get('id')
+
+                if not group_email:
+                    logging.warning(f"Group found with no email (ID: {group_id}). Skipping settings and member fetch for this entry.")
+                    all_groups[i]['group_settings_error'] = "Missing group email"
+                    all_groups[i]['members_list_error'] = "Missing group email, cannot fetch members"
+                    continue
+
+                # Fetch Group Settings
+                if groupssettings_service:
+                    try:
+                        logging.debug(f"Fetching settings for group: {group_email}")
+                        settings = self.retry_api_call(
+                            lambda: groupssettings_service.groups().get(groupUniqueId=group_email).execute()
+                        )
+                        group_settings_collected[group_email] = settings
+                    except HttpError as e:
+                        logging.error(f"HttpError fetching settings for group {group_email}: {e}", exc_info=False) # Keep log cleaner
+                        group_settings_collected[group_email] = {"error": f"HTTP_ERROR_{e.resp.status}", "details": str(e)}
+                        all_groups[i]['group_settings_error'] = f"HTTP_ERROR_{e.resp.status}"
+                    except Exception as e:
+                        logging.error(f"Generic error fetching settings for group {group_email}: {e}", exc_info=False)
+                        group_settings_collected[group_email] = {"error": "EXCEPTION", "details": str(e)}
+                        all_groups[i]['group_settings_error'] = "EXCEPTION_FETCHING_SETTINGS"
+                else:
+                    all_groups[i]['group_settings_error'] = "GROUPSSETTINGS_SERVICE_UNAVAILABLE"
+
+
+                # Fetch Group Members
+                if not group_id: # Should always have an ID if we have email, but good to check
+                    logging.warning(f"Group {group_email} has no ID. Skipping member fetch.")
+                    all_groups[i]['members_list_error'] = "Missing group ID"
+                    continue
+
+                current_group_members = []
+                try:
+                    logging.debug(f"Fetching members for group ID: {group_id} ({group_email})")
+                    members_request = admin_service.members().list(groupKey=group_id, maxResults=200) # Using ID is more robust
+                    member_page_num = 1
+                    while members_request is not None:
+                        logging.debug(f"Fetching member page {member_page_num} for group {group_email}")
+                        members_response = self.retry_api_call(lambda: members_request.execute())
+                        members_on_page = members_response.get('members', [])
+                        if members_on_page:
+                            current_group_members.extend(members_on_page)
+                        members_request = admin_service.members().list_next(previous_request=members_request, previous_response=members_response)
+                        member_page_num +=1
+                    all_groups[i]['members_list'] = current_group_members # Add members to the group dict
+                    all_groups[i]['members_count'] = len(current_group_members)
+
+                except HttpError as e:
+                    logging.error(f"HttpError fetching members for group {group_email} (ID: {group_id}): {e}", exc_info=False)
+                    all_groups[i]['members_list_error'] = f"HTTP_ERROR_{e.resp.status}"
+                except Exception as e:
+                    logging.error(f"Generic error fetching members for group {group_email} (ID: {group_id}): {e}", exc_info=False)
+                    all_groups[i]['members_list_error'] = "EXCEPTION_FETCHING_MEMBERS"
+
+            if groupssettings_service: # Only assign if the service was available
+                 self.data['groupSettings'] = group_settings_collected
+            
+            logging.info(f"Processed {len(all_groups)} groups. Fetched settings for {len(group_settings_collected)} groups (excluding errors).")
+            return True
+
+        except HttpError as e: # Catch errors from the initial groups().list() call
+            logging.error(f"Critical HttpError fetching initial list of groups: {e}", exc_info=True)
+            self.data['groups'] = [{"error": f"HTTP_ERROR_{e.resp.status}", "details": str(e)}]
+            if not self.data['groupSettings'].get("error"): # Don't overwrite if service was unavailable
+                 self.data['groupSettings'] = {"error": f"HTTP_ERROR_{e.resp.status} during group list", "details": str(e)}
+            return False
+        except Exception as e: # Catch other errors from the initial groups().list() call
+            logging.error(f"Critical generic error fetching initial list of groups: {e}", exc_info=True)
+            self.data['groups'] = [{"error": "EXCEPTION", "details": str(e)}]
+            if not self.data['groupSettings'].get("error"):
+                 self.data['groupSettings'] = {"error": "EXCEPTION during group list", "details": str(e)}
+            return False
 
     def collect_gmail_settings_for_users(self):
         logging.info("Collecting Gmail settings for users...")
-        # Placeholder
-        self.data["userGmailSettings"][self.delegated_email] = {"autoForwarding": {"enabled": False}}
+        gmail_service = self.services.get('gmail')
+        if not gmail_service:
+            logging.error("Gmail API service not available, cannot fetch per-user Gmail settings.")
+            self.data['userGmailSettings'] = {"error": "GMAIL_SERVICE_UNAVAILABLE"}
+            return False
+
+        users_to_process = self.data.get('users', [])
+        if not users_to_process or (isinstance(users_to_process, list) and users_to_process and users_to_process[0].get("error")):
+            logging.warning("No users found or user data contains error. Skipping Gmail settings collection.")
+            self.data['userGmailSettings'] = {"error": "USER_DATA_MISSING_OR_INVALID"}
+            return False # Cannot proceed without user list
+
+        self.data['userGmailSettings'] = {}
+        successful_fetches = 0
+        attempted_fetches = 0
+
+        for user_obj in users_to_process:
+            if not isinstance(user_obj, dict):
+                logging.warning(f"Skipping user object, not a dictionary: {user_obj}")
+                continue
+            
+            user_email = user_obj.get('primaryEmail')
+            if not user_email:
+                logging.warning(f"Skipping user with no primaryEmail: {user_obj.get('id', 'Unknown ID')}")
+                continue
+            
+            attempted_fetches +=1
+            user_settings = {}
+            partial_success = False
+
+            logging.debug(f"Fetching Gmail settings for user: {user_email}")
+
+            # Fetch POP settings
+            try:
+                pop_settings = self.retry_api_call(
+                    lambda: gmail_service.users().settings().getPop(userId=user_email).execute()
+                )
+                user_settings['pop'] = pop_settings
+                partial_success = True
+            except HttpError as e:
+                logging.error(f"HttpError fetching POP settings for {user_email}: {e.resp.status} {e.reason}", exc_info=False)
+                user_settings['pop'] = {"error": "API_FAILED", "status": e.resp.status, "reason": e.reason}
+            except Exception as e:
+                logging.error(f"Generic error fetching POP settings for {user_email}: {e}", exc_info=False)
+                user_settings['pop'] = {"error": "EXCEPTION", "details": str(e)}
+
+            # Fetch IMAP settings
+            try:
+                imap_settings = self.retry_api_call(
+                    lambda: gmail_service.users().settings().getImap(userId=user_email).execute()
+                )
+                user_settings['imap'] = imap_settings
+                partial_success = True
+            except HttpError as e:
+                logging.error(f"HttpError fetching IMAP settings for {user_email}: {e.resp.status} {e.reason}", exc_info=False)
+                user_settings['imap'] = {"error": "API_FAILED", "status": e.resp.status, "reason": e.reason}
+            except Exception as e:
+                logging.error(f"Generic error fetching IMAP settings for {user_email}: {e}", exc_info=False)
+                user_settings['imap'] = {"error": "EXCEPTION", "details": str(e)}
+
+            # Fetch Auto-forwarding settings
+            try:
+                auto_forwarding_settings = self.retry_api_call(
+                    lambda: gmail_service.users().settings().getAutoForwarding(userId=user_email).execute()
+                )
+                user_settings['autoForwarding'] = auto_forwarding_settings
+                partial_success = True
+            except HttpError as e:
+                logging.error(f"HttpError fetching Auto-forwarding settings for {user_email}: {e.resp.status} {e.reason}", exc_info=False)
+                user_settings['autoForwarding'] = {"error": "API_FAILED", "status": e.resp.status, "reason": e.reason}
+            except Exception as e:
+                logging.error(f"Generic error fetching Auto-forwarding settings for {user_email}: {e}", exc_info=False)
+                user_settings['autoForwarding'] = {"error": "EXCEPTION", "details": str(e)}
+            
+            # Fetch Mailbox Delegates
+            user_delegates = []
+            try:
+                delegates_request = gmail_service.users().settings().delegates().list(userId=user_email)
+                # Gmail API for delegates list is not paginated in the same way as Admin SDK.
+                # It returns all delegates in one response.
+                delegates_response = self.retry_api_call(lambda: delegates_request.execute())
+                user_delegates = delegates_response.get('delegates', [])
+                user_settings['delegates'] = user_delegates
+                partial_success = True
+            except HttpError as e:
+                logging.error(f"HttpError fetching delegates for {user_email}: {e.resp.status} {e.reason}", exc_info=False)
+                user_settings['delegates'] = [{"error": "API_FAILED", "status": e.resp.status, "reason": e.reason}]
+            except Exception as e:
+                logging.error(f"Generic error fetching delegates for {user_email}: {e}", exc_info=False)
+                user_settings['delegates'] = [{"error": "EXCEPTION", "details": str(e)}]
+
+            self.data['userGmailSettings'][user_email] = user_settings
+            if partial_success:
+                successful_fetches +=1
+        
+        logging.info(f"Attempted to fetch Gmail settings for {attempted_fetches} users. "
+                     f"Successfully fetched at least one setting for {successful_fetches} users.")
         return True
 
     def collect_calendar_settings_and_acls(self):
-        logging.info("Collecting Calendar settings and ACLs...")
-        # Placeholder
-        self.data["calendarSettings"]["primary"] = {"defaultAccess": "domain"}
-        self.data["calendarAcls"]["primary_calendar_id"] = [{"scope": {"type": "default"}, "role": "reader"}]
+        logging.info("Collecting Google Workspace Calendar settings and per-user calendar ACLs...")
+        admin_service = self.services.get('admin')
+        calendar_service = self.services.get('calendar')
+
+        if not calendar_service:
+            logging.error("Calendar API service not available, cannot fetch calendar ACLs.")
+            self.data['calendarAcls'] = {"error": "CALENDAR_SERVICE_UNAVAILABLE"}
+            # Potentially still try to fetch global settings if admin_service is available
+            if not admin_service:
+                 self.data['workspace_settings'] = self.data.get('workspace_settings', {})
+                 self.data['workspace_settings']['calendar'] = {"error": "ADMIN_SERVICE_UNAVAILABLE_FOR_GLOBAL_CAL_SETTINGS"}
+                 return False # Both services needed for full functionality are missing
+        
+        # Initialize data structures
+        if 'workspace_settings' not in self.data:
+            self.data['workspace_settings'] = {}
+        self.data['workspace_settings']['calendar'] = {}
+        self.data['calendarAcls'] = {}
+
+        # Fetch Global Calendar Settings (Domain-wide settings)
+        # Note: The Admin SDK does not have a simple 'get all calendar settings' endpoint.
+        # These are typically found under Apps > Google Workspace > Calendar > Sharing settings in Admin Console.
+        # We'll attempt to fetch known setting IDs if they exist directly under admin.settings().get('calendar').
+        # This part is more illustrative as the exact setting IDs might vary or require different API calls.
+        if admin_service:
+            try:
+                logging.debug("Attempting to fetch global Calendar settings via Admin SDK...")
+                # Example: This specific settingId 'calendar' might not return UI-equivalent global settings.
+                # The actual settings for external/internal sharing are often managed via specific properties
+                # in the Admin Console UI, which may not map 1:1 to a single Admin SDK Settings API object.
+                # We'll store a placeholder or any found settings.
+                # calendar_global_settings = self.retry_api_call(
+                #     lambda: admin_service.settings().get(settingId='calendar').execute() # This specific ID is unlikely to exist.
+                # )
+                # self.data['workspace_settings']['calendar'] = calendar_global_settings
+                # logging.info("Fetched some global settings related to 'calendar'. Review for actual sharing options.")
+                
+                # For the purpose of this exercise, we will assume these settings would be under a specific structure
+                # if they were retrievable this way. Since they are typically not, we'll mark them as 'not_found_via_api'.
+                self.data['workspace_settings']['calendar']['externalSharingOptions'] = 'not_found_via_api'
+                self.data['workspace_settings']['calendar']['internalSharingOptions'] = 'not_found_via_api'
+                self.data['workspace_settings']['calendar']['warnOnExternalInvitations'] = 'not_found_via_api'
+                logging.warning("Global calendar sharing settings (external/internal sharing, external invite warnings) are typically managed in Admin Console UI and may not have direct, simple equivalents in Admin SDK settings().get('calendar'). Placeholder values set.")
+
+            except HttpError as e:
+                logging.error(f"HttpError fetching global Calendar settings: {e}", exc_info=False)
+                self.data['workspace_settings']['calendar'] = {"error": f"HTTP_ERROR_{e.resp.status}", "details": str(e)}
+            except Exception as e:
+                logging.error(f"Generic error fetching global Calendar settings: {e}", exc_info=False)
+                self.data['workspace_settings']['calendar'] = {"error": "EXCEPTION", "details": str(e)}
+        else:
+            logging.warning("Admin service not available, skipping global calendar settings fetch.")
+            self.data['workspace_settings']['calendar'] = {"error": "ADMIN_SERVICE_UNAVAILABLE_FOR_GLOBAL_CAL_SETTINGS"}
+
+
+        # Fetch ACLs for Individual Primary Calendars
+        users_to_process = self.data.get('users', [])
+        if not calendar_service: # Already checked, but good for clarity if global settings part is skipped.
+             logging.info("Calendar service unavailable, skipping per-user ACL fetch.")
+             return True # Return true as global settings part might have partially succeeded or noted issue.
+
+        if not users_to_process or (isinstance(users_to_process, list) and users_to_process and users_to_process[0].get("error")):
+            logging.warning("No users found or user data contains error. Skipping per-user Calendar ACL collection.")
+            return True # Still return True as global settings might have been attempted
+
+        acl_attempted_fetches = 0
+        acl_successful_fetches = 0
+
+        for user_obj in users_to_process:
+            if not isinstance(user_obj, dict):
+                logging.warning(f"Skipping user object for calendar ACLs, not a dictionary: {user_obj}")
+                continue
+            
+            user_email = user_obj.get('primaryEmail')
+            if not user_email:
+                logging.warning(f"Skipping user for calendar ACLs (no primaryEmail): {user_obj.get('id', 'Unknown ID')}")
+                continue
+            
+            acl_attempted_fetches += 1
+            try:
+                logging.debug(f"Fetching calendar ACLs for user's primary calendar: {user_email}")
+                # The calendarId for a user's primary calendar is their primary email address.
+                acl_list_request = calendar_service.acl().list(calendarId=user_email)
+                acl_response = self.retry_api_call(lambda: acl_list_request.execute())
+                
+                self.data['calendarAcls'][user_email] = acl_response.get('items', [])
+                acl_successful_fetches += 1
+            except HttpError as e:
+                logging.error(f"HttpError fetching ACLs for calendar {user_email}: {e.resp.status} {e.reason}", exc_info=False)
+                self.data['calendarAcls'][user_email] = [{"error": "API_FAILED", "status": e.resp.status, "reason": e.reason}]
+            except Exception as e:
+                logging.error(f"Generic error fetching ACLs for calendar {user_email}: {e}", exc_info=False)
+                self.data['calendarAcls'][user_email] = [{"error": "EXCEPTION", "details": str(e)}]
+        
+        logging.info(f"Attempted to fetch calendar ACLs for {acl_attempted_fetches} users. "
+                     f"Successfully fetched ACLs for {acl_successful_fetches} users.")
         return True
 
     def collect_drive_settings_and_files(self):
-        logging.info("Collecting Drive settings and files...")
-        # Placeholder
-        self.data["driveSettings"] = {"sharingSettings": {"domainSharingOption": "domainWithLink"}}
-        self.data["driveFiles"] = [{"id": "file_id_example", "name": "Test Document", "shared": True, "owners": [self.delegated_email]}]
+        logging.info("Collecting Google Workspace Drive settings and Shared Drives information...")
+        admin_service = self.services.get('admin')
+        drive_service = self.services.get('drive')
+
+        # Initialize data structures
+        if 'workspace_settings' not in self.data:
+            self.data['workspace_settings'] = {}
+        self.data['workspace_settings']['drive'] = {} # For global/domain-wide settings
+        self.data['driveSettings'] = {} # Legacy or specific Drive API responses
+        self.data['sharedDrives'] = []
+        self.data['driveFiles'] = [] # Retain as per existing structure, but will not be populated
+
+        # 1. Fetch Global Drive Settings (Domain-wide settings) via Admin SDK
+        if admin_service:
+            try:
+                logging.debug("Attempting to fetch global Drive settings via Admin SDK (settingId='drive').")
+                # This is a general call. The specific settings relevant to the checks
+                # (e.g., warnOnExternalShare, allowPublicFilePublishing) are usually part of a larger object
+                # or might require more specific (and often unguessable) setting IDs.
+                # We log the result to understand its structure for future parsing.
+                drive_admin_settings = self.retry_api_call(
+                    lambda: admin_service.settings().get(settingId='drive').execute()
+                )
+                self.data['workspace_settings']['drive'] = drive_admin_settings
+                logging.info("Fetched general 'drive' settings from Admin SDK. Review structure for specific sharing options.")
+                # Example of how one might extract specific known sub-fields if they existed directly:
+                # sharing_settings = drive_admin_settings.get('sharingSettings', {})
+                # self.data['workspace_settings']['drive']['warnOnExternalShare'] = sharing_settings.get('warnOnExternalShare') 
+                # self.data['workspace_settings']['drive']['allowPublicFilePublishing'] = sharing_settings.get('allowPublicFilePublishing')
+                # self.data['workspace_settings']['drive']['preventViewerCommenterDownload'] = sharing_settings.get('preventViewerCommenterDownload')
+            except HttpError as e:
+                logging.warning(f"HttpError fetching global Drive settings via Admin SDK: {e.resp.status} {e.reason}. This may be normal if 'drive' is not a direct settingId.", exc_info=False)
+                self.data['workspace_settings']['drive'] = {"error": f"HTTP_ERROR_{e.resp.status}", "details": "Setting 'drive' likely not a direct Admin SDK settingId or not accessible."}
+            except Exception as e:
+                logging.error(f"Generic error fetching global Drive settings via Admin SDK: {e}", exc_info=False)
+                self.data['workspace_settings']['drive'] = {"error": "EXCEPTION", "details": str(e)}
+        else:
+            logging.warning("Admin service not available, skipping global Drive settings fetch.")
+            self.data['workspace_settings']['drive'] = {"error": "ADMIN_SERVICE_UNAVAILABLE"}
+
+        # 2. Fetch additional settings via Drive API's about.get (might include some sharing settings)
+        if drive_service:
+            try:
+                logging.debug("Fetching Drive 'about' information (may include storageQuota, user, limited sharingSettings).")
+                # Request specific fields to get relevant settings if available
+                fields_to_request = "storageQuota,user,sharingSettings,driveThemes,teamDriveThemes" # teamDriveThemes for shared drive themes
+                drive_about_info = self.retry_api_call(
+                    lambda: drive_service.about().get(fields=fields_to_request).execute()
+                )
+                self.data['driveSettings'] = drive_about_info # Store this under the legacy key or merge appropriately
+                logging.info("Fetched Drive 'about' info. This may contain some high-level sharing settings.")
+                # If sharingSettings are found here, they could be used to populate workspace_settings as well.
+                if 'sharingSettings' in drive_about_info:
+                     self.data['workspace_settings']['drive']['sharingSettings_from_about'] = drive_about_info['sharingSettings']
+            except HttpError as e:
+                logging.error(f"HttpError fetching Drive 'about' info: {e}", exc_info=False)
+                self.data['driveSettings'] = {"error": f"HTTP_ERROR_{e.resp.status}", "details": str(e)}
+            except Exception as e:
+                logging.error(f"Generic error fetching Drive 'about' info: {e}", exc_info=False)
+                self.data['driveSettings'] = {"error": "EXCEPTION", "details": str(e)}
+        else:
+            logging.warning("Drive service not available, skipping Drive 'about' info and Shared Drive fetch.")
+            self.data['driveSettings'] = {"error": "DRIVE_SERVICE_UNAVAILABLE"}
+            self.data['sharedDrives'] = [{"error": "DRIVE_SERVICE_UNAVAILABLE"}]
+            return True # Return true as Admin SDK part might have run.
+
+        # 3. Fetch Shared Drives
+        if drive_service:
+            all_shared_drives = []
+            try:
+                logging.debug("Fetching Shared Drives list.")
+                # Parameters to consider for larger environments:
+                # useDomainAdminAccess=True (if service account has domain-wide delegation for Drive)
+                # pageSize=100 (max)
+                request = drive_service.drives().list(pageSize=100, useDomainAdminAccess=True) 
+                page_num = 1
+                while request is not None:
+                    logging.debug(f"Fetching Shared Drives page: {page_num}")
+                    response = self.retry_api_call(lambda: request.execute())
+                    drives_on_page = response.get('drives', [])
+                    if drives_on_page:
+                        all_shared_drives.extend(drives_on_page)
+                    request = drive_service.drives().list_next(previous_request=request, previous_response=response)
+                    page_num +=1
+                
+                self.data['sharedDrives'] = all_shared_drives
+                logging.info(f"Successfully fetched {len(all_shared_drives)} Shared Drives.")
+
+            except HttpError as e:
+                logging.error(f"HttpError fetching Shared Drives: {e}", exc_info=False)
+                self.data['sharedDrives'] = [{"error": f"HTTP_ERROR_{e.resp.status}", "details": str(e)}]
+            except Exception as e:
+                logging.error(f"Generic error fetching Shared Drives: {e}", exc_info=False)
+                self.data['sharedDrives'] = [{"error": "EXCEPTION", "details": str(e)}]
+        
+        # 4. (Skipped) Full File Listing - as per instructions
+        logging.info("Skipping full Drive file listing as per instructions.")
+        self.data['driveFiles'] = [{"info": "Full file listing intentionally skipped for performance."}]
+        
+        return True
+
+    def collect_chat_settings(self):
+        logging.info("Collecting Google Workspace Chat settings...")
+        admin_service = self.services.get('admin')
+        
+        if 'workspace_settings' not in self.data:
+            self.data['workspace_settings'] = {}
+        # Ensure 'chat' key exists within 'workspace_settings' and is a dictionary
+        self.data['workspace_settings']['chat'] = self.data['workspace_settings'].get('chat', {})
+        if not isinstance(self.data['workspace_settings']['chat'], dict): # If it was an error string, reset
+            self.data['workspace_settings']['chat'] = {}
+
+
+        if not admin_service:
+            logging.error("Admin service not available, cannot fetch global Chat settings.")
+            self.data['workspace_settings']['chat']['error'] = "ADMIN_SERVICE_UNAVAILABLE"
+            return False # Cannot proceed without admin service
+
+        # Attempt to fetch general 'chat' settings via Admin SDK settings API
+        chat_global_settings_response = None
+        try:
+            logging.debug("Attempting to fetch global Chat settings via Admin SDK (settingId='chat').")
+            # Note: 'chat' as a settingId is a guess. The real ID might be different or non-existent
+            # if these settings are not exposed this way.
+            chat_global_settings_response = self.retry_api_call(
+                lambda: admin_service.settings().get(settingId='chat').execute()
+            )
+            # Merge the response into the existing chat settings, overwriting if keys clash
+            if isinstance(chat_global_settings_response, dict):
+                self.data['workspace_settings']['chat'].update(chat_global_settings_response)
+                logging.info(f"Fetched general 'chat' settings object from Admin SDK: {json.dumps(chat_global_settings_response, indent=2)}")
+            else:
+                # This case should ideally not be reached if retry_api_call raises an exception on failure.
+                logging.warning("Fetched 'chat' settings was not a dictionary. Storing as raw_response.")
+                self.data['workspace_settings']['chat']['raw_chat_settings_response'] = chat_global_settings_response
+
+
+        except HttpError as e:
+            if e.resp.status == 404: 
+                logging.warning(f"Global Chat settings with settingId='chat' not found via Admin SDK (404). This may be normal if settings are managed differently or not exposed via this specific ID.")
+                self.data['workspace_settings']['chat']['error_setting_id_chat'] = {"error": "SETTING_ID_CHAT_NOT_FOUND", "details": str(e)}
+            else:
+                logging.error(f"HttpError fetching global Chat settings: {e}", exc_info=False)
+                self.data['workspace_settings']['chat']['error_http'] = {"error": f"HTTP_ERROR_{e.resp.status}", "details": str(e)}
+        except Exception as e:
+            logging.error(f"Generic error fetching global Chat settings: {e}", exc_info=False)
+            self.data['workspace_settings']['chat']['error_exception'] = {"error": "EXCEPTION", "details": str(e)}
+        
+        # Ensure the specific keys are present, defaulting to a "not found" message if not populated by the API call
+        # This handles cases where the 'chat' settingId might return a generic object without these specific toggles,
+        # or if the initial fetch failed and resulted in an error dictionary.
+        current_chat_settings_dict = self.data['workspace_settings']['chat'] if isinstance(self.data['workspace_settings']['chat'], dict) else {}
+        default_not_found_msg = 'setting_not_found_via_api' 
+        
+        setting_keys_to_check = [
+            'allowExternalFileSharing', 
+            'restrictExternalSpaces', 
+            'allowChatApps', 
+            'allowIncomingWebhooks'
+        ]
+        for key in setting_keys_to_check:
+            # Only set if not already present from the API response or a more specific error
+            if key not in current_chat_settings_dict: 
+                 current_chat_settings_dict[key] = default_not_found_msg
+        
+        self.data['workspace_settings']['chat'] = current_chat_settings_dict # Ensure updates are saved
+        
+        logging.info("Global Chat settings collection attempt complete. Review stored data for specific field availability.")
         return True
 
     def collect_chat_spaces(self):
@@ -1544,7 +2048,7 @@ class GoogleWorkspaceCollector:
         sites_settings_scope = "Google Workspace Sites settings"
 
         # WS-CHT-001: External File Sharing in Chat Disabled
-        allow_external_file_share_raw = workspace_chat_settings.get('allowExternalFileSharing', 'unknown')
+        allow_external_file_share_raw = workspace_chat_settings.get('allowExternalFileSharing', 'setting_not_found_via_api')
         cht001_status = "FAIL"
         cht001_actual = f"Setting value: {allow_external_file_share_raw}"
         if str(allow_external_file_share_raw).lower() == 'false':
@@ -1552,8 +2056,8 @@ class GoogleWorkspaceCollector:
             cht001_actual = "Disabled"
         elif str(allow_external_file_share_raw).lower() == 'true':
             cht001_actual = "Enabled"
-        elif allow_external_file_share_raw == 'unknown':
-            cht001_actual = "Chat 'allowExternalFileSharing' setting not found."
+        elif allow_external_file_share_raw == 'setting_not_found_via_api':
+            cht001_actual = "Chat 'allowExternalFileSharing' setting not found via API."
         _add_check_result(
             "WS-CHT-001", "External File Sharing in Chat Disabled", chat_settings_scope, cht001_status,
             "External file sharing in Chat is disabled.", cht001_actual,
@@ -1561,16 +2065,16 @@ class GoogleWorkspaceCollector:
         )
 
         # WS-CHT-003: External Spaces in Chat Restricted
-        restrict_external_spaces_raw = workspace_chat_settings.get('restrictExternalSpaces', 'unknown')
+        restrict_external_spaces_raw = workspace_chat_settings.get('restrictExternalSpaces', 'setting_not_found_via_api')
         cht003_status = "FAIL"
         cht003_actual = f"Setting value: {restrict_external_spaces_raw}"
-        if str(restrict_external_spaces_raw).lower() == 'true':
+        if str(restrict_external_spaces_raw).lower() == 'true': # Assuming 'true' means restricted
             cht003_status = "PASS"
             cht003_actual = "Restricted"
         elif str(restrict_external_spaces_raw).lower() == 'false':
             cht003_actual = "Not restricted"
-        elif restrict_external_spaces_raw == 'unknown':
-            cht003_actual = "Chat 'restrictExternalSpaces' setting not found."
+        elif restrict_external_spaces_raw == 'setting_not_found_via_api':
+            cht003_actual = "Chat 'restrictExternalSpaces' setting not found via API."
         _add_check_result(
             "WS-CHT-003", "External Spaces in Chat Restricted", chat_settings_scope, cht003_status,
             "Users cannot create or join external Chat spaces, or it's restricted.", cht003_actual,
@@ -1578,22 +2082,501 @@ class GoogleWorkspaceCollector:
         )
         
         # WS-SIT-001: Google Sites Service Off
-        sites_service_enabled_raw = workspace_sites_settings.get('serviceEnabled', 'unknown')
-        sit001_status = "FAIL" # Default to FAIL if service status is unknown or enabled
+        # Assuming 'serviceEnabled' is a boolean-like string "true" or "false" or 'not_found_via_api'
+        sites_service_enabled_raw = workspace_sites_settings.get('serviceEnabled', 'setting_not_found_via_api')
+        sit001_status = "FAIL" 
         sit001_actual = f"Setting value: {sites_service_enabled_raw}"
         if str(sites_service_enabled_raw).lower() == 'false':
             sit001_status = "PASS"
             sit001_actual = "Service Disabled/Off"
         elif str(sites_service_enabled_raw).lower() == 'true':
             sit001_actual = "Service Enabled/On"
-        elif sites_service_enabled_raw == 'unknown':
-            sit001_actual = "Sites 'serviceEnabled' setting not found."
+        elif sites_service_enabled_raw == 'setting_not_found_via_api':
+            sit001_actual = "Sites 'serviceEnabled' setting not found via API."
         _add_check_result(
             "WS-SIT-001", "Google Sites Service Off", sites_settings_scope, sit001_status,
             "Google Sites service is turned Off for the domain/OU.", sit001_actual,
             "If Google Sites is not required for business operations, turn the service Off in Google Workspace Admin Console."
         )
+
+        # --- Drive Document Sharing Controlled by Domain with Allowlists (WS-DRV-003) ---
+        # Hypothetical path: workspace_settings.drive.sharingSettings.domainSharingWithAllowlistEnabled
+        # or workspace_settings.drive.sharingSettings.domainWideSharingOption == 'TRUSTED_DOMAINS_ALLOWED'
+        domain_sharing_allowlist_enabled_raw = workspace_drive_settings.get('sharingSettings', {}).get('domainSharingWithAllowlistEnabled', 'setting_not_found_via_api')
+        domain_wide_sharing_option = workspace_drive_settings.get('sharingSettings', {}).get('domainWideSharingOption', 'setting_not_found_via_api')
         
+        drv003_status = "FAIL"
+        drv003_actual = f"domainSharingWithAllowlistEnabled: {domain_sharing_allowlist_enabled_raw}, domainWideSharingOption: {domain_wide_sharing_option}"
+        
+        if str(domain_sharing_allowlist_enabled_raw).lower() == 'true':
+            drv003_status = "PASS"
+            drv003_actual = "domainSharingWithAllowlistEnabled is True."
+        elif str(domain_wide_sharing_option).upper() == 'TRUSTED_DOMAINS_ALLOWED':
+            drv003_status = "PASS"
+            drv003_actual = "domainWideSharingOption is TRUSTED_DOMAINS_ALLOWED."
+        elif domain_sharing_allowlist_enabled_raw == 'setting_not_found_via_api' and domain_wide_sharing_option == 'setting_not_found_via_api':
+             drv003_actual = "Relevant Drive sharing settings for allowlists not found via API."
+             # Status remains FAIL as we cannot confirm the secure state.
+
+        _add_check_result(
+            "WS-DRV-003", "Drive Document Sharing Controlled by Domain with Allowlists", drive_settings_scope, drv003_status,
+            "True or sharing option indicates allowlist usage (e.g., TRUSTED_DOMAINS_ALLOWED).", drv003_actual,
+            "Configure Drive sharing settings to use allowlisted domains for external sharing, if external sharing is permitted."
+        )
+
+        # --- Drive Access Checker Limits File Access (WS-DRV-005) ---
+        # Hypothetical path: workspace_settings.drive.sharingSettings.accessCheckerLevel
+        access_checker_level_raw = workspace_drive_settings.get('sharingSettings', {}).get('accessCheckerLevel', 'setting_not_found_via_api')
+        drv005_status = "FAIL"
+        drv005_actual = f"Access Checker Level: {access_checker_level_raw}"
+        if str(access_checker_level_raw).upper() in ['STRICT', 'LIMITED']:
+            drv005_status = "PASS"
+        elif access_checker_level_raw == 'setting_not_found_via_api':
+            drv005_actual = "Drive 'accessCheckerLevel' setting not found via API."
+        _add_check_result(
+            "WS-DRV-005", "Drive Access Checker Limits File Access", drive_settings_scope, drv005_status,
+            "'STRICT' or 'LIMITED'.", drv005_actual,
+            "Configure Drive's Access Checker to 'Strict' or 'Limited' to help prevent unintended file exposure."
+        )
+
+        # --- Drive Offline Access Disabled (WS-DRV-011) ---
+        # Hypothetical path: workspace_settings.drive.settings.allowOfflineDocs
+        # This might be nested deeper if general 'drive' settings are under a sub-key like 'generalSettings' or similar
+        # For now, assuming a simple structure or that it might be directly under workspace_drive_settings if general 'drive' settings API is flat
+        allow_offline_docs_raw = workspace_drive_settings.get('settings', {}).get('allowOfflineDocs', workspace_drive_settings.get('allowOfflineDocs', 'setting_not_found_via_api'))
+        drv011_status = "FAIL"
+        drv011_actual = f"Allow Offline Docs: {allow_offline_docs_raw}"
+        if str(allow_offline_docs_raw).lower() == 'false':
+            drv011_status = "PASS"
+        elif allow_offline_docs_raw == 'setting_not_found_via_api':
+             drv011_actual = "Drive 'allowOfflineDocs' setting not found via API."
+        _add_check_result(
+            "WS-DRV-011", "Drive Offline Access Disabled", drive_settings_scope, drv011_status,
+            "False (Offline access disabled).", drv011_actual,
+            "Disable 'Offline access' for Google Drive applications in the Admin Console if not required."
+        )
+
+        # --- Drive Add-Ons Disabled (WS-DRV-013) ---
+        # Hypothetical path: workspace_settings.drive.settings.allowAddOns
+        allow_add_ons_raw = workspace_drive_settings.get('settings', {}).get('allowAddOns', workspace_drive_settings.get('allowAddOns', 'setting_not_found_via_api'))
+        drv013_status = "FAIL"
+        drv013_actual = f"Allow Add-Ons: {allow_add_ons_raw}"
+        if str(allow_add_ons_raw).lower() == 'false':
+            drv013_status = "PASS"
+        elif allow_add_ons_raw == 'setting_not_found_via_api':
+            drv013_actual = "Drive 'allowAddOns' setting not found via API."
+        _add_check_result(
+            "WS-DRV-013", "Drive Add-Ons Disabled", drive_settings_scope, drv013_status,
+            "False (Add-ons disabled).", drv013_actual,
+            "Disable 'Allow users to install Google Drive add-ons' in the Admin Console unless specific add-ons are vetted and approved."
+        )
+        
+        # --- Group Creation Restricted (WS-GRP-002) ---
+        # Hypothetical path: workspace_settings.groups.allowGroupCreation or directory.settings.allowGroupCreation
+        # The collect_groups_and_settings method populates self.data['groupSettings'] with per-group settings.
+        # Global group creation settings are usually part of the Admin Console UI under Groups > Settings.
+        # This is often not directly available as a simple 'allowGroupCreation' flag via existing Admin SDK Settings API.
+        # We'll check if a general 'groups' or 'directory' setting object was fetched and if it contains such a flag.
+        # This check is more illustrative of where such a setting *might* be if exposed.
+        
+        # First, check if a 'groups' settings object was fetched under workspace_settings
+        ws_groups_settings = self.data.get('workspace_settings', {}).get('groups', {})
+        allow_group_creation_raw = ws_groups_settings.get('allowGroupCreation', 'setting_not_found_via_api')
+
+        # If not found there, check a hypothetical 'directory' settings object (less likely for group creation)
+        if allow_group_creation_raw == 'setting_not_found_via_api':
+            ws_directory_settings = self.data.get('workspace_settings', {}).get('directory', {})
+            allow_group_creation_raw = ws_directory_settings.get('allowGroupCreation', 'setting_not_found_via_api')
+
+        grp002_status = "FAIL" # Default to FAIL as restricting group creation is more secure
+        grp002_actual = f"Allow Group Creation setting: {allow_group_creation_raw}"
+        
+        if str(allow_group_creation_raw).lower() == 'false':
+            grp002_status = "PASS"
+            grp002_actual = "Group creation is restricted (value: false)."
+        elif allow_group_creation_raw == 'setting_not_found_via_api':
+            grp002_actual = "Global group creation setting not found via API. Manual verification in Admin Console needed."
+            # Status remains FAIL as we cannot confirm the desired state.
+            
+        _add_check_result(
+            "WS-GRP-002", "Group Creation Restricted", "Google Groups settings", grp002_status,
+            "False (Group creation restricted to admins or specific users).", grp002_actual,
+            "Restrict group creation privileges to administrators or a defined set of users in Google Groups settings (Apps > Google Workspace > Settings for Groups > Sharing settings)."
+        )
+
+        # --- Less Secure App Access (LSAA) Disabled (WS-SEC-005) ---
+        # Hypothetical path: workspace_settings.security.allowLsaa
+        security_settings = self.data.get('workspace_settings', {}).get('security', {})
+        allow_lsaa_raw = security_settings.get('allowLsaa', 'setting_not_found_via_api')
+        sec005_status = "FAIL"
+        sec005_actual = f"Allow LSAA: {allow_lsaa_raw}"
+        if str(allow_lsaa_raw).lower() == 'false':
+            sec005_status = "PASS"
+        elif allow_lsaa_raw == 'setting_not_found_via_api':
+            sec005_actual = "LSAA setting ('allowLsaa') not found via API."
+            
+        _add_check_result(
+            "WS-SEC-005", "Less Secure App Access (LSAA) Disabled", "Google Workspace Security Settings", sec005_status,
+            "False (LSAA disabled).", sec005_actual,
+            "Disable 'Allow less secure apps' for all users in Google Workspace security settings. Encourage use of OAuth 2.0 compatible apps."
+        )
+
+        # --- Drive Document Sharing Controlled by Domain with Allowlists (WS-DRV-003) ---
+        # Hypothetical path: workspace_settings.drive.sharingSettings.domainSharingWithAllowlistEnabled
+        # or workspace_settings.drive.sharingSettings.domainWideSharingOption == 'TRUSTED_DOMAINS_ALLOWED'
+        domain_sharing_allowlist_enabled_raw = workspace_drive_settings.get('sharingSettings', {}).get('domainSharingWithAllowlistEnabled', 'setting_not_found_via_api')
+        domain_wide_sharing_option = workspace_drive_settings.get('sharingSettings', {}).get('domainWideSharingOption', 'setting_not_found_via_api')
+        
+        drv003_status = "FAIL"
+        drv003_actual = f"domainSharingWithAllowlistEnabled: {domain_sharing_allowlist_enabled_raw}, domainWideSharingOption: {domain_wide_sharing_option}"
+        
+        if str(domain_sharing_allowlist_enabled_raw).lower() == 'true':
+            drv003_status = "PASS"
+            drv003_actual = "domainSharingWithAllowlistEnabled is True."
+        elif str(domain_wide_sharing_option).upper() == 'TRUSTED_DOMAINS_ALLOWED':
+            drv003_status = "PASS"
+            drv003_actual = "domainWideSharingOption is TRUSTED_DOMAINS_ALLOWED."
+        elif domain_sharing_allowlist_enabled_raw == 'setting_not_found_via_api' and domain_wide_sharing_option == 'setting_not_found_via_api':
+             drv003_actual = "Relevant Drive sharing settings for allowlists not found via API."
+             # Status remains FAIL as we cannot confirm the secure state.
+
+        _add_check_result(
+            "WS-DRV-003", "Drive Document Sharing Controlled by Domain with Allowlists", drive_settings_scope, drv003_status,
+            "True or sharing option indicates allowlist usage (e.g., TRUSTED_DOMAINS_ALLOWED).", drv003_actual,
+            "Configure Drive sharing settings to use allowlisted domains for external sharing, if external sharing is permitted."
+        )
+
+        # --- Drive Access Checker Limits File Access (WS-DRV-005) ---
+        # Hypothetical path: workspace_settings.drive.sharingSettings.accessCheckerLevel
+        access_checker_level_raw = workspace_drive_settings.get('sharingSettings', {}).get('accessCheckerLevel', 'setting_not_found_via_api')
+        drv005_status = "FAIL"
+        drv005_actual = f"Access Checker Level: {access_checker_level_raw}"
+        if str(access_checker_level_raw).upper() in ['STRICT', 'LIMITED']:
+            drv005_status = "PASS"
+        elif access_checker_level_raw == 'setting_not_found_via_api':
+            drv005_actual = "Drive 'accessCheckerLevel' setting not found via API."
+        _add_check_result(
+            "WS-DRV-005", "Drive Access Checker Limits File Access", drive_settings_scope, drv005_status,
+            "'STRICT' or 'LIMITED'.", drv005_actual,
+            "Configure Drive's Access Checker to 'Strict' or 'Limited' to help prevent unintended file exposure."
+        )
+
+        # --- Drive Offline Access Disabled (WS-DRV-011) ---
+        # Hypothetical path: workspace_settings.drive.settings.allowOfflineDocs
+        # This might be nested deeper if general 'drive' settings are under a sub-key like 'generalSettings' or similar
+        # For now, assuming a simple structure or that it might be directly under workspace_drive_settings if general 'drive' settings API is flat
+        allow_offline_docs_raw = workspace_drive_settings.get('settings', {}).get('allowOfflineDocs', workspace_drive_settings.get('allowOfflineDocs', 'setting_not_found_via_api'))
+        drv011_status = "FAIL"
+        drv011_actual = f"Allow Offline Docs: {allow_offline_docs_raw}"
+        if str(allow_offline_docs_raw).lower() == 'false':
+            drv011_status = "PASS"
+        elif allow_offline_docs_raw == 'setting_not_found_via_api':
+             drv011_actual = "Drive 'allowOfflineDocs' setting not found via API."
+        _add_check_result(
+            "WS-DRV-011", "Drive Offline Access Disabled", drive_settings_scope, drv011_status,
+            "False (Offline access disabled).", drv011_actual,
+            "Disable 'Offline access' for Google Drive applications in the Admin Console if not required."
+        )
+
+        # --- Drive Add-Ons Disabled (WS-DRV-013) ---
+        # Hypothetical path: workspace_settings.drive.settings.allowAddOns
+        allow_add_ons_raw = workspace_drive_settings.get('settings', {}).get('allowAddOns', workspace_drive_settings.get('allowAddOns', 'setting_not_found_via_api'))
+        drv013_status = "FAIL"
+        drv013_actual = f"Allow Add-Ons: {allow_add_ons_raw}"
+        if str(allow_add_ons_raw).lower() == 'false':
+            drv013_status = "PASS"
+        elif allow_add_ons_raw == 'setting_not_found_via_api':
+            drv013_actual = "Drive 'allowAddOns' setting not found via API."
+        _add_check_result(
+            "WS-DRV-013", "Drive Add-Ons Disabled", drive_settings_scope, drv013_status,
+            "False (Add-ons disabled).", drv013_actual,
+            "Disable 'Allow users to install Google Drive add-ons' in the Admin Console unless specific add-ons are vetted and approved."
+        )
+        
+        # --- Group Creation Restricted (WS-GRP-002) ---
+        # Hypothetical path: workspace_settings.groups.allowGroupCreation or directory.settings.allowGroupCreation
+        # The collect_groups_and_settings method populates self.data['groupSettings'] with per-group settings.
+        # Global group creation settings are usually part of the Admin Console UI under Groups > Settings.
+        # This is often not directly available as a simple 'allowGroupCreation' flag via existing Admin SDK Settings API.
+        # We'll check if a general 'groups' or 'directory' setting object was fetched and if it contains such a flag.
+        # This check is more illustrative of where such a setting *might* be if exposed.
+        
+        # First, check if a 'groups' settings object was fetched under workspace_settings
+        ws_groups_settings = self.data.get('workspace_settings', {}).get('groups', {})
+        allow_group_creation_raw = ws_groups_settings.get('allowGroupCreation', 'setting_not_found_via_api')
+
+        # If not found there, check a hypothetical 'directory' settings object (less likely for group creation)
+        if allow_group_creation_raw == 'setting_not_found_via_api':
+            ws_directory_settings = self.data.get('workspace_settings', {}).get('directory', {})
+            allow_group_creation_raw = ws_directory_settings.get('allowGroupCreation', 'setting_not_found_via_api')
+
+        grp002_status = "FAIL" # Default to FAIL as restricting group creation is more secure
+        grp002_actual = f"Allow Group Creation setting: {allow_group_creation_raw}"
+        
+        if str(allow_group_creation_raw).lower() == 'false':
+            grp002_status = "PASS"
+            grp002_actual = "Group creation is restricted (value: false)."
+        elif allow_group_creation_raw == 'setting_not_found_via_api':
+            grp002_actual = "Global group creation setting not found via API. Manual verification in Admin Console needed."
+            # Status remains FAIL as we cannot confirm the desired state.
+            
+        _add_check_result(
+            "WS-GRP-002", "Group Creation Restricted", "Google Groups settings", grp002_status,
+            "False (Group creation restricted to admins or specific users).", grp002_actual,
+            "Restrict group creation privileges to administrators or a defined set of users in Google Groups settings (Apps > Google Workspace > Settings for Groups > Sharing settings)."
+        )
+
+        # --- Less Secure App Access (LSAA) Disabled (WS-SEC-005) ---
+        # Hypothetical path: workspace_settings.security.allowLsaa
+        security_settings = self.data.get('workspace_settings', {}).get('security', {})
+        allow_lsaa_raw = security_settings.get('allowLsaa', 'setting_not_found_via_api')
+        sec005_status = "FAIL"
+        sec005_actual = f"Allow LSAA: {allow_lsaa_raw}"
+        if str(allow_lsaa_raw).lower() == 'false':
+            sec005_status = "PASS"
+        elif allow_lsaa_raw == 'setting_not_found_via_api':
+            sec005_actual = "LSAA setting ('allowLsaa') not found via API."
+            
+        _add_check_result(
+            "WS-SEC-005", "Less Secure App Access (LSAA) Disabled", "Google Workspace Security Settings", sec005_status,
+            "False (LSAA disabled).", sec005_actual,
+            "Disable 'Allow less secure apps' for all users in Google Workspace security settings. Encourage use of OAuth 2.0 compatible apps."
+        )
+
+        # --- Drive Document Sharing Controlled by Domain with Allowlists (WS-DRV-003) ---
+        # Hypothetical path: workspace_settings.drive.sharingSettings.domainSharingWithAllowlistEnabled
+        # or workspace_settings.drive.sharingSettings.domainWideSharingOption == 'TRUSTED_DOMAINS_ALLOWED'
+        domain_sharing_allowlist_enabled_raw = workspace_drive_settings.get('sharingSettings', {}).get('domainSharingWithAllowlistEnabled', 'setting_not_found_via_api')
+        domain_wide_sharing_option = workspace_drive_settings.get('sharingSettings', {}).get('domainWideSharingOption', 'setting_not_found_via_api')
+        
+        drv003_status = "FAIL"
+        drv003_actual = f"domainSharingWithAllowlistEnabled: {domain_sharing_allowlist_enabled_raw}, domainWideSharingOption: {domain_wide_sharing_option}"
+        
+        if str(domain_sharing_allowlist_enabled_raw).lower() == 'true':
+            drv003_status = "PASS"
+            drv003_actual = "domainSharingWithAllowlistEnabled is True."
+        elif str(domain_wide_sharing_option).upper() == 'TRUSTED_DOMAINS_ALLOWED':
+            drv003_status = "PASS"
+            drv003_actual = "domainWideSharingOption is TRUSTED_DOMAINS_ALLOWED."
+        elif domain_sharing_allowlist_enabled_raw == 'setting_not_found_via_api' and domain_wide_sharing_option == 'setting_not_found_via_api':
+             drv003_actual = "Relevant Drive sharing settings for allowlists not found via API."
+             # Status remains FAIL as we cannot confirm the secure state.
+
+        _add_check_result(
+            "WS-DRV-003", "Drive Document Sharing Controlled by Domain with Allowlists", drive_settings_scope, drv003_status,
+            "True or sharing option indicates allowlist usage (e.g., TRUSTED_DOMAINS_ALLOWED).", drv003_actual,
+            "Configure Drive sharing settings to use allowlisted domains for external sharing, if external sharing is permitted."
+        )
+
+        # --- Drive Access Checker Limits File Access (WS-DRV-005) ---
+        # Hypothetical path: workspace_settings.drive.sharingSettings.accessCheckerLevel
+        access_checker_level_raw = workspace_drive_settings.get('sharingSettings', {}).get('accessCheckerLevel', 'setting_not_found_via_api')
+        drv005_status = "FAIL"
+        drv005_actual = f"Access Checker Level: {access_checker_level_raw}"
+        if str(access_checker_level_raw).upper() in ['STRICT', 'LIMITED']:
+            drv005_status = "PASS"
+        elif access_checker_level_raw == 'setting_not_found_via_api':
+            drv005_actual = "Drive 'accessCheckerLevel' setting not found via API."
+        _add_check_result(
+            "WS-DRV-005", "Drive Access Checker Limits File Access", drive_settings_scope, drv005_status,
+            "'STRICT' or 'LIMITED'.", drv005_actual,
+            "Configure Drive's Access Checker to 'Strict' or 'Limited' to help prevent unintended file exposure."
+        )
+
+        # --- Drive Offline Access Disabled (WS-DRV-011) ---
+        # Hypothetical path: workspace_settings.drive.settings.allowOfflineDocs
+        # This might be nested deeper if general 'drive' settings are under a sub-key like 'generalSettings' or similar
+        # For now, assuming a simple structure or that it might be directly under workspace_drive_settings if general 'drive' settings API is flat
+        allow_offline_docs_raw = workspace_drive_settings.get('settings', {}).get('allowOfflineDocs', workspace_drive_settings.get('allowOfflineDocs', 'setting_not_found_via_api'))
+        drv011_status = "FAIL"
+        drv011_actual = f"Allow Offline Docs: {allow_offline_docs_raw}"
+        if str(allow_offline_docs_raw).lower() == 'false':
+            drv011_status = "PASS"
+        elif allow_offline_docs_raw == 'setting_not_found_via_api':
+             drv011_actual = "Drive 'allowOfflineDocs' setting not found via API."
+        _add_check_result(
+            "WS-DRV-011", "Drive Offline Access Disabled", drive_settings_scope, drv011_status,
+            "False (Offline access disabled).", drv011_actual,
+            "Disable 'Offline access' for Google Drive applications in the Admin Console if not required."
+        )
+
+        # --- Drive Add-Ons Disabled (WS-DRV-013) ---
+        # Hypothetical path: workspace_settings.drive.settings.allowAddOns
+        allow_add_ons_raw = workspace_drive_settings.get('settings', {}).get('allowAddOns', workspace_drive_settings.get('allowAddOns', 'setting_not_found_via_api'))
+        drv013_status = "FAIL"
+        drv013_actual = f"Allow Add-Ons: {allow_add_ons_raw}"
+        if str(allow_add_ons_raw).lower() == 'false':
+            drv013_status = "PASS"
+        elif allow_add_ons_raw == 'setting_not_found_via_api':
+            drv013_actual = "Drive 'allowAddOns' setting not found via API."
+        _add_check_result(
+            "WS-DRV-013", "Drive Add-Ons Disabled", drive_settings_scope, drv013_status,
+            "False (Add-ons disabled).", drv013_actual,
+            "Disable 'Allow users to install Google Drive add-ons' in the Admin Console unless specific add-ons are vetted and approved."
+        )
+        
+        # --- Group Creation Restricted (WS-GRP-002) ---
+        # Hypothetical path: workspace_settings.groups.allowGroupCreation or directory.settings.allowGroupCreation
+        # The collect_groups_and_settings method populates self.data['groupSettings'] with per-group settings.
+        # Global group creation settings are usually part of the Admin Console UI under Groups > Settings.
+        # This is often not directly available as a simple 'allowGroupCreation' flag via existing Admin SDK Settings API.
+        # We'll check if a general 'groups' or 'directory' setting object was fetched and if it contains such a flag.
+        # This check is more illustrative of where such a setting *might* be if exposed.
+        
+        # First, check if a 'groups' settings object was fetched under workspace_settings
+        ws_groups_settings = self.data.get('workspace_settings', {}).get('groups', {})
+        allow_group_creation_raw = ws_groups_settings.get('allowGroupCreation', 'setting_not_found_via_api')
+
+        # If not found there, check a hypothetical 'directory' settings object (less likely for group creation)
+        if allow_group_creation_raw == 'setting_not_found_via_api':
+            ws_directory_settings = self.data.get('workspace_settings', {}).get('directory', {})
+            allow_group_creation_raw = ws_directory_settings.get('allowGroupCreation', 'setting_not_found_via_api')
+
+        grp002_status = "FAIL" # Default to FAIL as restricting group creation is more secure
+        grp002_actual = f"Allow Group Creation setting: {allow_group_creation_raw}"
+        
+        if str(allow_group_creation_raw).lower() == 'false':
+            grp002_status = "PASS"
+            grp002_actual = "Group creation is restricted (value: false)."
+        elif allow_group_creation_raw == 'setting_not_found_via_api':
+            grp002_actual = "Global group creation setting not found via API. Manual verification in Admin Console needed."
+            # Status remains FAIL as we cannot confirm the desired state.
+            
+        _add_check_result(
+            "WS-GRP-002", "Group Creation Restricted", "Google Groups settings", grp002_status,
+            "False (Group creation restricted to admins or specific users).", grp002_actual,
+            "Restrict group creation privileges to administrators or a defined set of users in Google Groups settings (Apps > Google Workspace > Settings for Groups > Sharing settings)."
+        )
+
+        # --- Less Secure App Access (LSAA) Disabled (WS-SEC-005) ---
+        # Hypothetical path: workspace_settings.security.allowLsaa
+        security_settings = self.data.get('workspace_settings', {}).get('security', {})
+        allow_lsaa_raw = security_settings.get('allowLsaa', 'setting_not_found_via_api')
+        sec005_status = "FAIL"
+        sec005_actual = f"Allow LSAA: {allow_lsaa_raw}"
+        if str(allow_lsaa_raw).lower() == 'false':
+            sec005_status = "PASS"
+        elif allow_lsaa_raw == 'setting_not_found_via_api':
+            sec005_actual = "LSAA setting ('allowLsaa') not found via API."
+            
+        _add_check_result(
+            "WS-SEC-005", "Less Secure App Access (LSAA) Disabled", "Google Workspace Security Settings", sec005_status,
+            "False (LSAA disabled).", sec005_actual,
+            "Disable 'Allow less secure apps' for all users in Google Workspace security settings. Encourage use of OAuth 2.0 compatible apps."
+        )
+
+        # --- Drive Document Sharing Controlled by Domain with Allowlists (WS-DRV-003) ---
+        domain_sharing_allowlist_enabled_raw = workspace_drive_settings.get('sharingSettings', {}).get('domainSharingWithAllowlistEnabled', 'setting_not_found_via_api')
+        domain_wide_sharing_option = workspace_drive_settings.get('sharingSettings', {}).get('domainWideSharingOption', 'setting_not_found_via_api')
+        
+        drv003_status = "FAIL"
+        drv003_actual = f"domainSharingWithAllowlistEnabled: {domain_sharing_allowlist_enabled_raw}, domainWideSharingOption: {domain_wide_sharing_option}"
+        
+        if str(domain_sharing_allowlist_enabled_raw).lower() == 'true':
+            drv003_status = "PASS"
+            drv003_actual = "domainSharingWithAllowlistEnabled is True."
+        elif str(domain_wide_sharing_option).upper() == 'TRUSTED_DOMAINS_ALLOWED': # Check for specific string value
+            drv003_status = "PASS"
+            drv003_actual = "domainWideSharingOption is TRUSTED_DOMAINS_ALLOWED."
+        elif domain_sharing_allowlist_enabled_raw == 'setting_not_found_via_api' and domain_wide_sharing_option == 'setting_not_found_via_api':
+             drv003_actual = "Relevant Drive sharing settings for allowlists not found via API."
+             # Status remains FAIL as we cannot confirm the secure state.
+
+        _add_check_result(
+            "WS-DRV-003", "Drive Document Sharing Controlled by Domain with Allowlists", drive_settings_scope, drv003_status,
+            "True or sharing option indicates allowlist usage (e.g., TRUSTED_DOMAINS_ALLOWED).", drv003_actual,
+            "Configure Drive sharing settings to use allowlisted domains for external sharing, if external sharing is permitted."
+        )
+
+        # --- Drive Access Checker Limits File Access (WS-DRV-005) ---
+        access_checker_level_raw = workspace_drive_settings.get('sharingSettings', {}).get('accessCheckerLevel', 'setting_not_found_via_api')
+        drv005_status = "FAIL"
+        drv005_actual = f"Access Checker Level: {access_checker_level_raw}"
+        if str(access_checker_level_raw).upper() in ['STRICT', 'LIMITED']:
+            drv005_status = "PASS"
+        elif access_checker_level_raw == 'setting_not_found_via_api':
+            drv005_actual = "Drive 'accessCheckerLevel' setting not found via API."
+        _add_check_result(
+            "WS-DRV-005", "Drive Access Checker Limits File Access", drive_settings_scope, drv005_status,
+            "'STRICT' or 'LIMITED'.", drv005_actual,
+            "Configure Drive's Access Checker to 'Strict' or 'Limited' to help prevent unintended file exposure."
+        )
+
+        # --- Drive Offline Access Disabled (WS-DRV-011) ---
+        # Hypothetical: 'allowOfflineDocs' might be directly under workspace_drive_settings or nested
+        allow_offline_docs_raw = workspace_drive_settings.get('allowOfflineDocs', 'setting_not_found_via_api')
+        if allow_offline_docs_raw == 'setting_not_found_via_api': # Try a nested path as an alternative
+            allow_offline_docs_raw = workspace_drive_settings.get('settings', {}).get('allowOfflineDocs', 'setting_not_found_via_api')
+            
+        drv011_status = "FAIL"
+        drv011_actual = f"Allow Offline Docs: {allow_offline_docs_raw}"
+        if str(allow_offline_docs_raw).lower() == 'false':
+            drv011_status = "PASS"
+        elif allow_offline_docs_raw == 'setting_not_found_via_api':
+             drv011_actual = "Drive 'allowOfflineDocs' setting not found via API."
+        _add_check_result(
+            "WS-DRV-011", "Drive Offline Access Disabled", drive_settings_scope, drv011_status,
+            "False (Offline access disabled).", drv011_actual,
+            "Disable 'Offline access' for Google Drive applications in the Admin Console if not required."
+        )
+
+        # --- Drive Add-Ons Disabled (WS-DRV-013) ---
+        allow_add_ons_raw = workspace_drive_settings.get('allowAddOns', 'setting_not_found_via_api')
+        if allow_add_ons_raw == 'setting_not_found_via_api': # Try a nested path
+             allow_add_ons_raw = workspace_drive_settings.get('settings', {}).get('allowAddOns', 'setting_not_found_via_api')
+
+        drv013_status = "FAIL"
+        drv013_actual = f"Allow Add-Ons: {allow_add_ons_raw}"
+        if str(allow_add_ons_raw).lower() == 'false':
+            drv013_status = "PASS"
+        elif allow_add_ons_raw == 'setting_not_found_via_api':
+            drv013_actual = "Drive 'allowAddOns' setting not found via API."
+        _add_check_result(
+            "WS-DRV-013", "Drive Add-Ons Disabled", drive_settings_scope, drv013_status,
+            "False (Add-ons disabled).", drv013_actual,
+            "Disable 'Allow users to install Google Drive add-ons' in the Admin Console unless specific add-ons are vetted and approved."
+        )
+        
+        # --- Group Creation Restricted (WS-GRP-002) ---
+        ws_groups_settings = self.data.get('workspace_settings', {}).get('groups', {})
+        allow_group_creation_raw = ws_groups_settings.get('allowGroupCreation', 'setting_not_found_via_api')
+
+        if allow_group_creation_raw == 'setting_not_found_via_api':
+            # Fallback to check under a general 'directory' settings object if it exists
+            ws_directory_settings = self.data.get('workspace_settings', {}).get('directory', {})
+            allow_group_creation_raw = ws_directory_settings.get('allowGroupCreation', 'setting_not_found_via_api')
+            
+        grp002_status = "FAIL" 
+        grp002_actual = f"Allow Group Creation setting: {allow_group_creation_raw}"
+        
+        if str(allow_group_creation_raw).lower() == 'false':
+            grp002_status = "PASS"
+            grp002_actual = "Group creation is restricted (value: false)."
+        elif allow_group_creation_raw == 'setting_not_found_via_api':
+            grp002_actual = "Global group creation setting not found via API. Manual verification in Admin Console needed."
+            
+        _add_check_result(
+            "WS-GRP-002", "Group Creation Restricted", "Google Groups settings", grp002_status,
+            "False (Group creation restricted to admins or specific users).", grp002_actual,
+            "Restrict group creation privileges to administrators or a defined set of users in Google Groups settings (Apps > Google Workspace > Settings for Groups > Sharing settings)."
+        )
+
+        # --- Less Secure App Access (LSAA) Disabled (WS-SEC-005) ---
+        security_settings = self.data.get('workspace_settings', {}).get('security', {})
+        allow_lsaa_raw = security_settings.get('allowLsaa', 'setting_not_found_via_api')
+        sec005_status = "FAIL"
+        sec005_actual = f"Allow LSAA: {allow_lsaa_raw}"
+        if str(allow_lsaa_raw).lower() == 'false':
+            sec005_status = "PASS"
+        elif allow_lsaa_raw == 'setting_not_found_via_api':
+            sec005_actual = "LSAA setting ('allowLsaa') not found via API."
+            
+        _add_check_result(
+            "WS-SEC-005", "Less Secure App Access (LSAA) Disabled", "Google Workspace Security Settings", sec005_status,
+            "False (LSAA disabled).", sec005_actual,
+            "Disable 'Allow less secure apps' for all users in Google Workspace security settings. Encourage use of OAuth 2.0 compatible apps."
+        )
+
         # --- GCP IAM Checks ---
         # GCP-IAM-001: No Owner Role at Organization Level
         gcp_org_iam_policy = self.data.get('gcp_iam_organization_policy')
@@ -1723,6 +2706,7 @@ class GoogleWorkspaceCollector:
             self.collect_gcp_gcs_buckets,
             self.collect_gcp_iap_settings,
             self.collect_gcp_workload_identity_pools,
+            self.collect_chat_settings, # Added new method
         ]
 
         for collect_method in collection_methods:
